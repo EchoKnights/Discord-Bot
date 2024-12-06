@@ -1,0 +1,1 @@
+Devil#s Advocate is meant to be a passion project, a discord bot capable of fitting my every day needs as well as a couple special cases that will be outlined in the near future. This will also serve as an example of my proficiency with both python and the discord.py library as well as any sublibraries i may use.
