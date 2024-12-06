@@ -12,21 +12,32 @@ class timercommands(commands.Cog):
 
     @dc.app_commands.command(name="start_timer", description="Start a timer.")
     async def timerStart(self, interaction: dc.Interaction, h: int = 0, m: int = 0, s: int = 0):
-        duration = (h * 60 * 60) + (m * 60) + s
+        try:
+            duration = (h * 60 * 60) + (m * 60) + s
 
-        if (duration <= 0):
-            await interaction.response.send_message("Please input an actual amount of time.")
-            return
-            
-        user_id = interaction.user.id
+            if duration <= 0:
+                await interaction.response.send_message("Please input an actual amount of time.")
+                return
 
-        await interaction.response.send_message(f'Started a timer for {h}h:{m}m:{s}s')
+            user_id = interaction.user.id
 
-        if user_id not in self.timers:
-            self.timers[user_id] = []
+            if user_id not in self.timers:
+                self.timers[user_id] = []
 
-        timer_task = self.bot.loop.create_task(self.run_timer(interaction, duration))
-        self.timers[user_id].append(timer_task)
+            if len(self.timers[user_id]) >= 3:
+                await interaction.response.send_message("You already have 3 active timers, relax.")
+                return
+    
+            await interaction.response.send_message(f'Started a timer for {h}h:{m}m:{s}s')
+
+            if user_id not in self.timers:
+                self.timers[user_id] = []
+
+            timer_task = self.bot.loop.create_task(self.run_timer(interaction, duration))
+            self.timers[user_id].append(timer_task)
+        except Exception as e:
+            print(f"Error starting timer: {e}")
+            await interaction.response.send_message("An error occurred while starting the timer.", ephemeral=True)
     
     async def run_timer(self, interaction: dc.Interaction, duration: int):
         user_id = interaction.user.id
@@ -38,7 +49,9 @@ class timercommands(commands.Cog):
             await interaction.followup.send(content="The timer was canceled.")
         finally:
             if user_id in self.timers:
-                self.timers[user_id] = [t for t in self.timers[user_id] if not t.done()]
+                current_task = asyncio.current_task()
+                self.timers[user_id] = [t for t in self.timers[user_id] if t is not current_task]
+                
                 if not self.timers[user_id]:
                     del self.timers[user_id]
 

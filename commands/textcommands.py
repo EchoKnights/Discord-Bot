@@ -8,7 +8,6 @@ import asyncio
 class textcommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.timers = {}
 
     @commands.Cog.listener()
     async def on_ready():
