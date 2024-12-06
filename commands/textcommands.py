@@ -3,10 +3,12 @@ import discord as dc
 import GitIgnorables.Authcode as Authcode
 from discord import app_commands
 from discord.ext import commands
+import asyncio
 
 class textcommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.timers = {}
 
     @commands.Cog.listener()
     async def on_ready():
