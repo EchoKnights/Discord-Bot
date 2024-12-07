@@ -35,6 +35,27 @@ class textcommands(commands.Cog):
         time = self.bot.latency * 1000
         await interaction.response.send_message(f'My ping returned after: {time: .2f}ms')
 
-        
+    @dc.app_commands.command(name="purge", description="Purges the last specified amount of messages from the channel")
+    async def purgeMessage(self, interaction: dc.Interaction, amount: int):
+        try:
+            if(amount <= 0):
+                await interaction.response.send_message("Please enter a valid amount of messages")
+                return
+            elif (amount > 50):
+                await interaction.response.send_message("Please enter a smaller amount of messages")
+                return
+            
+            await interaction.response.defer(ephemeral=True)
+
+            deleted = await interaction.channel.purge(limit=amount)
+
+        except Exception as e:
+            print(f"Couldn't purge {amount} messages in {interaction.channel} due to {e}")
+
+        log_channel = dc.utils.get(interaction.guild.text_channels, name="da-logs")
+        if log_channel:
+            await log_channel.send(f"{interaction.user} requested the deletion of {len(deleted)} messages in #{interaction.channel.name}")
+        await interaction.response.send_message(f"Successfully deleted {len(deleted) - 1} messages.")
+
 async def setup(bot):
     await bot.add_cog(textcommands(bot))
