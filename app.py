@@ -3,6 +3,8 @@ import discord as dc
 import GitIgnorables.Authcode as Authcode
 import commands.textcommands
 import asyncio
+import os
+import json
 from discord import app_commands
 from discord.ext import commands
 
@@ -84,6 +86,21 @@ async def on_guild_join(guild: dc.Guild):
         print(f"Log channel created: {log_channel.name}")
     except Exception as e:
         print(f"Couldn't create log channel due to: {e}")
+
+    try:
+        QUOTE_DIR = "server_quotes"
+        def get_server_file(guild_id):
+            return os.path.join(QUOTE_DIR, f"{guild_id}.json")
+        
+        file_path = get_server_file(guild.id)
+        if not os.path.exists(file_path):
+            with open(file_path, "w") as f:
+                json.dump([], f, indent=4)
+            print(f"Created a new quotes file for guild: {guild.name} ({guild.id})")
+        else:
+            print(f"Quotes file for guild {guild.name} ({guild.id}) already exists.")
+    except Exception as e:
+        print(f'Couldnt create the server quote file due to: {e}')
 
 #Run Function
 async def run():
