@@ -1,11 +1,17 @@
 import sys
 import discord as dc
 import GitIgnorables.Authcode as Authcode
+import commands.textcommands
+import asyncio
+import os
+import json
 from discord import app_commands
 from discord.ext import commands
 
 intents = dc.Intents.default()
 intents.message_content = True
+intents.guilds = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
@@ -24,28 +30,82 @@ async def on_ready():
     except Exception as e:
         print(f'Failed to sync commands due to: {e}')
 
-#Commands
-@bot.tree.command(name="quit", description="Makes the Bot exit for debugging purposes")
-async def terminate(interaction: dc.Interaction):
-        await interaction.response.send_message("Shutting down the bot.")
-        await bot.close()
-        sys.exit(0)
-
-
-@bot.tree.command(name="message_channel", description="Sends a message to the requested channel")
-async def channelMessage(interaction: dc.Interaction, channel: dc.TextChannel, msg: str):
+@bot.event
+async def on_guild_join(guild: dc.Guild):
+    print(f"Bot joined a new guild: {guild.name} ({guild.id})")
+    overwrites = {
+        guild.default_role: dc.PermissionOverwrite(read_messages=False),
+        guild.me: dc.PermissionOverwrite(read_messages=True),
+    }
+    
     try:
-        #add an anti-spam feature and check if it sees hidden messages the user cant see.
-        await channel.send(content=f"{msg}")
-        await interaction.response.send_message("Sent.")
+        print("Attempting to create debug role...")
+        debug_role = await guild.create_role(
+            name="DA Debug",
+            color=dc.Color.dark_gray(),
+            permissions=dc.Permissions(permissions=5),
+            reason="Auto-created by bot for debugging purposes"
+        )
+        print(f"Debug role created: {debug_role.name}")
     except Exception as e:
-        #Next time make it so that it sends the message to a debug channel automatically created when joining a guild
-        print(f'Couldnt send the message due to {e}')
+        debug_role = None
+        print(f'Failed to create debug role due to: {e}')
 
-@bot.tree.command(name="ping", description="See how much latency the bot is suffering from")
-async def ping(interaction: dc.Interaction):
-     time = bot.latency * 1000
-     await interaction.response.send_message(f'My ping returned after: {time: .2f}ms')
+    if debug_role:
+        overwrites[debug_role] = dc.PermissionOverwrite(read_messages=True)
 
-#Run Command
-bot.run(Authcode.token)
+    try:
+        dj_role = await guild.create_role(
+            name="Devil's DJ",
+            color=dc.Color.red(),
+            permissions=dc.Permissions(permissions=5),
+            reason="Auto-created to allow music operation."
+        )
+        print(f"DJ role created: {dj_role.name}")
+    except Exception as e:
+        print(f'Failed to create DJ role due to: {e}')
+
+    try:
+        print("Attempting to create debug channel...")
+        debug_channel = await guild.create_text_channel(
+            name='devils-advocate-debug-channel',
+            overwrites=overwrites,
+            reason="Auto-created by bot for debugging purposes"
+        )
+        print(f"Debug channel created: {debug_channel.name}")
+    except Exception as e:
+        print(f"Couldn't create debug channel due to: {e}")
+
+    try:
+        print("Attempting to create log channel...")
+        log_channel = await guild.create_text_channel(
+            name='da-logs',
+            overwrites=overwrites,
+            reason="Auto-created by bot for logging purposes"
+        )
+        print(f"Log channel created: {log_channel.name}")
+    except Exception as e:
+        print(f"Couldn't create log channel due to: {e}")
+
+    try:
+        QUOTE_DIR = "server_quotes"
+        def get_server_file(guild_id):
+            return os.path.join(QUOTE_DIR, f"{guild_id}.json")
+        
+        file_path = get_server_file(guild.id)
+        if not os.path.exists(file_path):
+            with open(file_path, "w") as f:
+                json.dump([], f, indent=4)
+            print(f"Created a new quotes file for guild: {guild.name} ({guild.id})")
+        else:
+            print(f"Quotes file for guild {guild.name} ({guild.id}) already exists.")
+    except Exception as e:
+        print(f'Couldnt create the server quote file due to: {e}')
+
+#Run Function
+async def run():
+    async with bot:
+        await bot.load_extension("commands")
+        await bot.start(Authcode.token)
+
+asyncio.run(run())
