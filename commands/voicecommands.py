@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import sys
 import nacl
 import discord as dc
@@ -9,34 +10,49 @@ import os
 class voicecommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.last_activity_time = None
+        self.voice_channel = None
+        self.voice_client = None
+        self.inactivity_task = None
+
+    async def inactivityAutoLeave(self):
+        while self.voice_client and self.voice_client.is_connected():
+            if self.last_activity_time and datetime.utcnow() - self.last_activity_time > timedelta(minutes=2):
+                await self.voice_client.disconnect()
+                self.voice_client = None
+                self.last_activity_time = None
+                return
+            await asyncio.sleep(30)
 
     @dc.app_commands.command(name="join_vc", description="Joins the voice channel you are currently connected to")
     async def joinVC(self, interaction: dc.Interaction):
-        voice_channel = interaction.user.voice.channel
         await interaction.response.send_message("Joining")
+        text_channel = interaction.channel
         try:
-            if(voice_channel):
-                voice_client = await voice_channel.connect()
+            if interaction.user.voice is None or interaction.user.voice.channel is None:
+                await interaction.followup.send("Connect to the voice channel you want me to connect to")
+                return
 
-                async def inactivityAutoLeave():
-                    await asyncio.sleep((2 * 60))
-                    if voice_client.is_connected(): 
-                        await voice_client.disconnect()
+            self.voice_channel = interaction.user.voice.channel
+            self.voice_client = await self.voice_channel.connect()
+            self.last_activity_time = datetime.utcnow()
 
-                await inactivityAutoLeave()
-            else:
-                interaction.response.send_message("Connect to the voice channel you want me to connect to")
+            if self.inactivity_task is None or self.inactivity_task.done():
+                self.inactivity_task = asyncio.create_task(self.inactivityAutoLeave())
+
         except Exception as e:
             print(f'Couldnt join vc due to {e}')
 
     @dc.app_commands.command(name="leave_vc", description="Leaves the voice channel the bot is currently connected to")
     async def leaveVC(self, interaction: dc.Interaction):
         await interaction.response.send_message("Leaving")
-        voice_channel = dc.utils.get(self.bot.voice_clients, guild=interaction.guild)
-        if(voice_channel):
-            await voice_channel.disconnect()
+        if self.voice_client and self.voice_client.is_connected():
+            await self.voice_client.disconnect()
+            self.voice_client = None
+            self.last_activity_time = None
         else:
-            interaction.response.send_message("I am not connected to voice channel")
+            await interaction.followup.send("I am not connected to a voice channel")
+    
 
 async def setup(bot):
     await bot.add_cog(voicecommands(bot))
