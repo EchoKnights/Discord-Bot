@@ -1,18 +1,33 @@
-from datetime import datetime, timedelta
-import sys
-import nacl
-import traceback
-import yt_dlp as ytdl
 import re
+import os
+import asyncio
+import logging
+import traceback
+from datetime import datetime, timedelta
+from collections import defaultdict
+
 import discord as dc
 from discord import opus
 from discord import app_commands
 from discord.ext import commands
-import asyncio
-import os
-import logging
+import yt_dlp as ytdl
+import html
 
-# Configure logging
+current_directory = os.path.dirname(os.path.abspath(__file__))
+parent_directory = os.path.abspath(os.path.join(current_directory, ".."))
+dll_path = os.path.join(parent_directory, "libopus-0.dll")
+
+if not os.path.exists(dll_path):
+    raise FileNotFoundError(f"Opus library not found at {dll_path}")
+
+if not dc.opus.is_loaded():
+    dc.opus.load_opus(dll_path)
+
+if dc.opus.is_loaded():
+    print("Opus library loaded successfully")
+else:
+    print("Failed to load Opus library")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('voicecommands')
 
@@ -24,303 +39,325 @@ YDL_OPTS = {
     'default_search': 'ytsearch',
 }
 
-current_directory = os.path.dirname(os.path.abspath(__file__))
-parent_directory = os.path.abspath(os.path.join(current_directory, ".."))
-dll_path = os.path.join(parent_directory, "libopus-0.dll")
+MAX_QUEUE_SIZE = 50
 
-if not os.path.exists(dll_path):
-    raise FileNotFoundError(f"Opus library not found at {dll_path}")
-else:
-    dc.opus.load_opus(dll_path)
+YOUTUBE_VIDEO_URL_REGEX = re.compile(
+    r'^(https?://)?(www\.)?'
+    r'(youtube\.com/watch\?v=|youtu\.be/)[\w-]{11}'
+    r'(?:&\S*)?$'
+)
 
-if dc.opus.is_loaded():
-    logger.info("Opus library loaded successfully")
-else:
-    logger.error("Failed to load Opus library")
+def is_valid_youtube_video_url(url: str) -> bool:
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'ignoreerrors': True,
+    }
+    with ytdl.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+            if info is None:
+                logger.debug(f"URL validation failed: No info extracted for {url}")
+                return False
+            if 'entries' in info:
+                logger.debug(f"URL validation failed: URL points to a playlist or multiple entries: {url}")
+                return False
+            if info.get('is_live'):
+                logger.debug(f"URL validation failed: URL points to a live stream: {url}")
+                return False
+            logger.debug(f"URL validation succeeded for {url}")
+            return True
+        except Exception as e:
+            logger.error(f"URL validation exception for {url}: {e}")
+            return False
+
+def sanitize_input(user_input: str) -> str:
+    return html.escape(user_input)
 
 class voicecommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.last_activity_time = None
-        self.voice_channel = None
-        self.voice_client = None
-        self.inactivity_task = None
-        self.queue = []
-        self.current_track = None
-        self.is_moving = False  # Flag to indicate if the bot is moving voice channels
+        self.guild_data = defaultdict(lambda: {
+            'last_activity_time': None,
+            'voice_channel': None,
+            'voice_client': None,
+            'inactivity_task': None,
+            'queue': [],
+            'current_track': None,
+            'is_moving': False,
+        })
 
-    async def inactivityAutoLeave(self):
-        while self.voice_client and self.voice_client.is_connected():
-            if self.last_activity_time and datetime.utcnow() - self.last_activity_time > timedelta(minutes=2):
-                await self.voice_client.disconnect()
-                logger.info("Disconnected due to inactivity.")
-                self.voice_client = None
-                self.last_activity_time = None
-                return
+    async def inactivity_auto_leave(self, guild_id: int):
+        await self.bot.wait_until_ready()
+        while True:
             await asyncio.sleep(30)
+            data = self.guild_data[guild_id]
+            if data['last_activity_time']:
+                elapsed = datetime.utcnow() - data['last_activity_time']
+                if elapsed > timedelta(minutes=2):
+                    if data['voice_client'] and data['voice_client'].is_connected():
+                        await data['voice_client'].disconnect()
+                        logger.info(f"Disconnected due to inactivity in guild {guild_id}")
+                    data['voice_client'] = None
+                    data['voice_channel'] = None
+                    data['current_track'] = None
+                    data['queue'].clear()
+                    data['last_activity_time'] = None
 
-    def after_play(self, error):
+    def after_play(self, error, guild_id: int):
         if error:
-            logger.error(f"Player error: {error}")
+            logger.error(f"Player error in guild {guild_id}: {error}")
+        data = self.guild_data[guild_id]
+        if not data['is_moving']:
+            coro = self.play_next(guild_id)
+            asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
 
-        # Only proceed if not moving to another voice channel
-        if not self.is_moving:
-            coro = self.play_next()
-            future = asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error in after_play coroutine: {e}")
-
-    async def play_next(self):
-        if not self.queue or not self.voice_client or not self.voice_client.is_connected():
-            self.current_track = None
-            logger.info("No more tracks in the queue or voice client disconnected.")
+    async def play_next(self, guild_id: int):
+        data = self.guild_data[guild_id]
+        if not data['queue']:
+            data['current_track'] = None
+            logger.info(f"No more tracks in the queue for guild {guild_id}")
             return
-
-        track = self.queue.pop(0)
-        self.current_track = track
-
-        self.last_activity_time = datetime.utcnow()
-
+        track = data['queue'].pop(0)
+        data['current_track'] = track
+        data['last_activity_time'] = datetime.utcnow()
         audio_source = dc.FFmpegPCMAudio(
             track['source_url'],
             before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
         )
-        self.voice_client.play(audio_source, after=self.after_play)
-        logger.info(f"Now playing: {track['title']}")
+        data['voice_client'].play(audio_source, after=lambda e: self.after_play(e, guild_id))
+        logger.info(f"Now playing in guild {guild_id}: {track['title']}")
 
-    def extract_info(self, query: str):
-        ydl_opts = YDL_OPTS.copy()
-
-        youtube_pattern = re.compile(r"(youtube\.com|youtu\.be)")
-
-        if youtube_pattern.search(query):
-            if "list=" in query:
-                ydl_opts['extract_flat'] = False
-                with ytdl.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(query, download=False)
-                    if 'entries' in info:
-                        logger.info(f"Extracted {len(info['entries'])} tracks from playlist")
-                        return info['entries'], True
-                    else:
-                        logger.info("Extracted a single track from playlist URL")
-                        return [info], False
-            else:
-                with ytdl.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(query, download=False)
-                    logger.info(f"Extracted single track: {info.get('title', 'Unknown title')}")
-                    return [info], False
-        else:
-            search_query = f"ytsearch:{query}"
-            with ytdl.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(search_query, download=False)
-                if 'entries' in info and info['entries']:
-                    logger.info(f"Extracted search result: {info['entries'][0].get('title', 'Unknown title')}")
-                    return [info['entries'][0]], False
-                else:
-                    logger.info("No search results found")
-                    return [], False
-
-    @dc.app_commands.command(name="join_vc", description="Joins the voice channel you are currently connected to")
-    async def joinVC(self, interaction: dc.Interaction):
-        await interaction.response.send_message("Joining voice channel...", ephemeral=True)
-        try:
-            if interaction.user.voice is None or interaction.user.voice.channel is None:
-                await interaction.followup.send("You need to be connected to a voice channel first.", ephemeral=True)
+    @dc.app_commands.command(name="join_vc", description="Joins the voice channel you are in")
+    async def join_vc(self, interaction: dc.Interaction):
+        guild_id = interaction.guild.id
+        user_voice = interaction.user.voice
+        await interaction.response.send_message("Joining your voice channel.", ephemeral=True)
+        if not user_voice or not user_voice.channel:
+            await interaction.followup.send("You need to be in a voice channel first.", ephemeral=True)
+            return
+        user_channel = user_voice.channel
+        data = self.guild_data[guild_id]
+        if data['voice_client']:
+            if data['voice_client'].channel.id == user_channel.id:
+                await interaction.followup.send("I'm already in your voice channel.", ephemeral=True)
                 return
+            else:
+                data['is_moving'] = True
+                if data['voice_client'].is_playing():
+                    data['voice_client'].pause()
+                    logger.info(f"Paused playback before moving in guild {guild_id}")
+                await data['voice_client'].disconnect()
+                data['voice_client'] = None
+                logger.info(f"Disconnected from previous voice channel in guild {guild_id}")
+        data['voice_channel'] = user_channel
+        data['voice_client'] = await user_channel.connect()
+        data['last_activity_time'] = datetime.utcnow()
+        if not data['inactivity_task'] or data['inactivity_task'].done():
+            data['inactivity_task'] = asyncio.create_task(self.inactivity_auto_leave(guild_id))
+        if data['current_track'] and not data['voice_client'].is_playing():
+            audio_source = dc.FFmpegPCMAudio(
+                data['current_track']['source_url'],
+                before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+            )
+            data['voice_client'].play(audio_source, after=lambda e: self.after_play(e, guild_id))
+            logger.info(f"Resumed playing in guild {guild_id}: {data['current_track']['title']}")
+        data['is_moving'] = False
+        await interaction.followup.send(f"Joined {user_channel.name}.", ephemeral=True)
 
-            user_voice_channel = interaction.user.voice.channel
-
-            if self.voice_client:
-                if self.voice_client.channel.id == user_voice_channel.id:
-                    await interaction.followup.send("I'm already in your voice channel!", ephemeral=True)
-                    return
-                else:
-                    self.is_moving = True  # Indicate that the bot is moving
-                    # Pause current playback if any
-                    if self.voice_client.is_playing():
-                        self.voice_client.pause()
-                        logger.info("Paused current playback before moving.")
-                    await self.voice_client.disconnect()
-                    self.voice_client = None
-                    logger.info("Disconnected from the previous voice channel.")
-                    self.is_moving = False  # Reset the moving flag
-
-            self.voice_channel = user_voice_channel
-            self.voice_client = await self.voice_channel.connect()
-            logger.info(f"Connected to voice channel: {self.voice_channel.name}")
-            self.last_activity_time = datetime.utcnow()
-
-            if self.inactivity_task is None or self.inactivity_task.done():
-                self.inactivity_task = asyncio.create_task(self.inactivityAutoLeave())
-
-            # Resume playback if there was a track paused
-            if self.current_track and not self.voice_client.is_playing():
-                audio_source = dc.FFmpegPCMAudio(
-                    self.current_track['source_url'],
-                    before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
-                )
-                self.voice_client.play(audio_source, after=self.after_play)
-                logger.info(f"Resumed playing: {self.current_track['title']}")
-
-            await interaction.followup.send(f"Joined {self.voice_channel.name}!", ephemeral=True)
-
-        except Exception as e:
-            logger.error(f"Couldn't join VC: {e}")
-            await interaction.followup.send(f"Couldn't join the voice channel: {e}", ephemeral=True)
-
-    @dc.app_commands.command(name="leave_vc", description="Leaves the voice channel the bot is currently connected to")
-    async def leaveVC(self, interaction: dc.Interaction):
-        await interaction.response.send_message("Leaving voice channel...", ephemeral=True)
-        if self.voice_client and self.voice_client.is_connected():
-            await self.voice_client.disconnect()
-            logger.info("Left the voice channel.")
-            self.voice_client = None
-            self.last_activity_time = None
-            self.current_track = None  # Optionally, you can set current_track to None
-            await interaction.followup.send("Left the voice channel.", ephemeral=True)
+    @dc.app_commands.command(name="leave_vc", description="Leaves the current voice channel")
+    async def leave_vc(self, interaction: dc.Interaction):
+        guild_id = interaction.guild.id
+        data = self.guild_data[guild_id]
+        await interaction.response.send_message("Leaving the voice channel.", ephemeral=True)
+        if data['voice_client'] and data['voice_client'].is_connected():
+            await data['voice_client'].disconnect()
+            logger.info(f"Left the voice channel in guild {guild_id}")
+            data['voice_client'] = None
+            data['voice_channel'] = None
+            data['current_track'] = None
+            data['queue'].clear()
+            data['last_activity_time'] = None
+            await interaction.followup.send("Left the voice channel and cleared the queue.", ephemeral=True)
         else:
-            await interaction.followup.send("I am not connected to any voice channel.", ephemeral=True)
+            await interaction.followup.send("I'm not connected to any voice channel.", ephemeral=True)
 
-    @dc.app_commands.command(name="play", description="Plays audio in the voice channel")
+    @dc.app_commands.command(name="play", description="Plays audio from a YouTube video link or search query")
     async def play(self, interaction: dc.Interaction, input: str):
-        await interaction.response.defer(ephemeral=False, thinking=True)
-
-        try:
-            if interaction.user.voice is None or interaction.user.voice.channel is None:
-                await interaction.followup.send("You need to be connected to a voice channel to use this command.", ephemeral=True)
+        guild_id = interaction.guild.id
+        data = self.guild_data[guild_id]
+        input = sanitize_input(input)
+        await interaction.response.defer(ephemeral=True)
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.followup.send("You need to be in a voice channel first.", ephemeral=True)
+            return
+        user_channel = interaction.user.voice.channel
+        if not data['voice_client'] or not data['voice_client'].is_connected():
+            data['voice_channel'] = user_channel
+            data['voice_client'] = await user_channel.connect()
+            logger.info(f"Connected to {user_channel.name} in guild {guild_id}")
+            data['last_activity_time'] = datetime.utcnow()
+            if not data['inactivity_task'] or data['inactivity_task'].done():
+                data['inactivity_task'] = asyncio.create_task(self.inactivity_auto_leave(guild_id))
+        else:
+            if data['voice_client'].channel.id != user_channel.id:
+                await interaction.followup.send("I'm already connected to another voice channel. Use `/join_vc` to move me.", ephemeral=True)
                 return
-
-            user_voice_channel = interaction.user.voice.channel
-
-            if not self.voice_client or not self.voice_client.is_connected():
-                self.voice_channel = user_voice_channel
-                self.voice_client = await self.voice_channel.connect()
-                logger.info(f"Connected to voice channel: {self.voice_channel.name}")
-                self.last_activity_time = datetime.utcnow()
-
-                if self.inactivity_task is None or self.inactivity_task.done():
-                    self.inactivity_task = asyncio.create_task(self.inactivityAutoLeave())
-
-                await interaction.followup.send(f"Joined {self.voice_channel.name} and added the track to the queue.", ephemeral=True)
-            else:
-                # Optionally, you can check if the bot is in the same channel as the user
-                if self.voice_client.channel.id != user_voice_channel.id:
-                    await interaction.followup.send("I'm already connected to another voice channel. Use `/join_vc` to move me.", ephemeral=True)
+        is_url = bool(YOUTUBE_VIDEO_URL_REGEX.match(input))
+        if is_url:
+            if not is_valid_youtube_video_url(input):
+                await interaction.followup.send("The provided link is not a valid YouTube video.", ephemeral=True)
+                return
+            video_url = input
+            with ytdl.YoutubeDL(YDL_OPTS) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+                if not info:
+                    await interaction.followup.send("Could not extract information from that link.", ephemeral=True)
                     return
-
-            results, is_playlist = self.extract_info(input)
-            if not results:
-                await interaction.followup.send("No results found for that query.")
+                formats = info.get('formats', [])
+                audio_format = next((f for f in formats if f.get('acodec') != 'none'), None)
+                if not audio_format:
+                    await interaction.followup.send("No suitable audio format found for this video.", ephemeral=True)
+                    return
+                audio_url = audio_format.get('url')
+            track = {
+                "title": info.get("title", "Unknown Title"),
+                "url": video_url,
+                "requester": interaction.user.display_name,
+                "source_url": audio_url
+            }
+            if len(data['queue']) >= MAX_QUEUE_SIZE:
+                await interaction.followup.send("The queue is full. Please wait for some tracks to finish.", ephemeral=True)
                 return
-
-            for entry in results:
-                # Use yt_dlp to get the direct audio URL
-                with ytdl.YoutubeDL(YDL_OPTS) as ydl:
-                    info = ydl.extract_info(entry['webpage_url'], download=False)
-                    # Choose the best audio format available
-                    formats = info.get('formats', [])
+            data['queue'].append(track)
+            logger.info(f"Added to queue in guild {guild_id}: {track['title']}")
+            if not data['current_track'] and not data['voice_client'].is_playing():
+                await self.play_next(guild_id)
+            await interaction.followup.send(f"Added **{track['title']}** to the queue.", ephemeral=True)
+        else:
+            search_query = f"ytsearch:{input}"
+            with ytdl.YoutubeDL(YDL_OPTS) as ydl:
+                info = ydl.extract_info(search_query, download=False)
+                if not info or 'entries' not in info or len(info['entries']) == 0:
+                    await interaction.followup.send("No results found for that query.", ephemeral=True)
+                    return
+                first_entry = info['entries'][0]
+                video_url = first_entry.get('webpage_url')
+                if not video_url:
+                    await interaction.followup.send("Could not retrieve video information.", ephemeral=True)
+                    return
+                if not is_valid_youtube_video_url(video_url):
+                    await interaction.followup.send("The top search result is not a valid YouTube video.", ephemeral=True)
+                    return
+                with ytdl.YoutubeDL(YDL_OPTS) as ydl_inner:
+                    info_inner = ydl_inner.extract_info(video_url, download=False)
+                    if not info_inner:
+                        await interaction.followup.send("Could not extract information from the top search result.", ephemeral=True)
+                        return
+                    formats = info_inner.get('formats', [])
                     audio_format = next((f for f in formats if f.get('acodec') != 'none'), None)
                     if not audio_format:
-                        await interaction.followup.send(f"Couldn't find a suitable audio format for {entry.get('title', 'Unknown Title')}.")
-                        continue
-                    audio_url = audio_format['url']
-
+                        await interaction.followup.send("No suitable audio format found for the top search result.", ephemeral=True)
+                        return
+                    audio_url = audio_format.get('url')
                 track = {
-                    "title": entry.get("title", "Unknown title"),
-                    "url": entry.get("webpage_url", ""),
+                    "title": info_inner.get("title", "Unknown Title"),
+                    "url": video_url,
                     "requester": interaction.user.display_name,
                     "source_url": audio_url
                 }
-                self.queue.append(track)
-                logger.info(f"Added to queue: {track['title']}")
-
-            if self.current_track is None and not self.voice_client.is_playing():
-                await self.play_next()
-
-            if is_playlist:
-                await interaction.followup.send(f"Added a playlist with {len(results)} tracks to the queue.")
-            else:
-                await interaction.followup.send(f"Added **{results[0]['title']}** to the queue.")
-
-        except Exception as e:
-            logger.error(f"Error while playing: {e}")
-            await interaction.followup.send("Failed to play the requested track.")
-            traceback.print_exc()
+                if len(data['queue']) >= MAX_QUEUE_SIZE:
+                    await interaction.followup.send("The queue is full. Please wait for some tracks to finish.", ephemeral=True)
+                    return
+                data['queue'].append(track)
+                logger.info(f"Added to queue in guild {guild_id}: {track['title']}")
+                if not data['current_track'] and not data['voice_client'].is_playing():
+                    await self.play_next(guild_id)
+                await interaction.followup.send(f"Added **{track['title']}** to the queue.", ephemeral=True)
 
     @dc.app_commands.command(name="skip", description="Skips the current track")
     async def skip(self, interaction: dc.Interaction):
-        if self.voice_client and self.voice_client.is_playing():
-            self.voice_client.stop()
+        guild_id = interaction.guild.id
+        data = self.guild_data[guild_id]
+        if data['voice_client'] and data['voice_client'].is_playing():
+            data['voice_client'].stop()
             await interaction.response.send_message("Skipped the current track.")
-            logger.info("Skipped the current track.")
+            logger.info(f"Skipped track in guild {guild_id}")
         else:
-            await interaction.response.send_message("Nothing is playing.")
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
 
     @dc.app_commands.command(name="pause", description="Pauses the current track")
     async def pause(self, interaction: dc.Interaction):
-        if self.voice_client and self.voice_client.is_playing():
-            self.voice_client.pause()
+        guild_id = interaction.guild.id
+        data = self.guild_data[guild_id]
+        if data['voice_client'] and data['voice_client'].is_playing():
+            data['voice_client'].pause()
             await interaction.response.send_message("Paused the current track.")
-            logger.info("Paused the current track.")
+            logger.info(f"Paused track in guild {guild_id}")
         else:
-            await interaction.response.send_message("Nothing is playing.")
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
 
     @dc.app_commands.command(name="resume", description="Resumes the current track")
     async def resume(self, interaction: dc.Interaction):
-        if self.voice_client and self.voice_client.is_paused():
-            self.voice_client.resume()
+        guild_id = interaction.guild.id
+        data = self.guild_data[guild_id]
+        if data['voice_client'] and data['voice_client'].is_paused():
+            data['voice_client'].resume()
             await interaction.response.send_message("Resumed the current track.")
-            logger.info("Resumed the current track.")
+            logger.info(f"Resumed track in guild {guild_id}")
         else:
-            await interaction.response.send_message("There is nothing to resume.")
+            await interaction.response.send_message("There is nothing to resume.", ephemeral=True)
 
     @dc.app_commands.command(name="clear", description="Stops playback and clears the queue")
     async def clear(self, interaction: dc.Interaction):
-        self.queue.clear()
-        if self.voice_client and self.voice_client.is_playing():
-            self.voice_client.stop()
-        self.current_track = None
+        guild_id = interaction.guild.id
+        data = self.guild_data[guild_id]
+        data['queue'].clear()
+        if data['voice_client'] and data['voice_client'].is_playing():
+            data['voice_client'].stop()
+        data['current_track'] = None
         await interaction.response.send_message("Stopped playback and cleared the queue.")
-        logger.info("Cleared the queue and stopped playback.")
+        logger.info(f"Cleared queue and stopped playback in guild {guild_id}")
 
     @dc.app_commands.command(name="queue", description="Displays the current queue")
     async def queue_cmd(self, interaction: dc.Interaction):
-        if not self.current_track and not self.queue:
+        guild_id = interaction.guild.id
+        data = self.guild_data[guild_id]
+        if not data['current_track'] and not data['queue']:
             await interaction.response.send_message("The queue is empty.", ephemeral=True)
             return
-
         embed = dc.Embed(title="Music Queue", color=dc.Color.blue())
-
-        if self.current_track:
+        if data['current_track']:
             embed.add_field(
                 name="Now Playing",
-                value=f"**{self.current_track['title']}**\nRequested by: {self.current_track['requester']}",
+                value=f"**{data['current_track']['title']}**\nRequested by: {data['current_track']['requester']}",
                 inline=False
             )
         else:
             embed.add_field(name="Now Playing", value="Nothing currently playing.", inline=False)
-
-        if self.queue:
-            queue_description = ""
-            for i, track in enumerate(self.queue, start=1):
-                queue_description += f"{i}. **{track['title']}** (Requested by: {track['requester']})\n"
+        if data['queue']:
+            queue_description = "\n".join(
+                f"{i}. **{t['title']}** (Requested by: {t['requester']})"
+                for i, t in enumerate(data['queue'], start=1)
+            )
             embed.add_field(name="Up Next", value=queue_description, inline=False)
         else:
             embed.add_field(name="Queue", value="The queue is empty.", inline=False)
-
         await interaction.response.send_message(embed=embed)
 
     @dc.app_commands.command(name="remove", description="Removes a track from the queue by its index")
     async def remove(self, interaction: dc.Interaction, index: int):
+        guild_id = interaction.guild.id
+        data = self.guild_data[guild_id]
         index = index - 1
-        if 0 <= index < len(self.queue):
-            removed = self.queue.pop(index)
+        if 0 <= index < len(data['queue']):
+            removed = data['queue'].pop(index)
             await interaction.response.send_message(f"Removed **{removed['title']}** from the queue.")
-            logger.info(f"Removed track from queue: {removed['title']}")
+            logger.info(f"Removed track from queue in guild {guild_id}: {removed['title']}")
         else:
-            await interaction.response.send_message("Invalid track index.")
+            await interaction.response.send_message("Invalid track index.", ephemeral=True)
+
 
 async def setup(bot):
     await bot.add_cog(voicecommands(bot))
