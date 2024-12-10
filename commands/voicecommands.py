@@ -5,7 +5,6 @@ import logging
 import traceback
 from datetime import datetime, timedelta
 from collections import defaultdict
-
 import discord as dc
 from discord import opus
 from discord import app_commands
@@ -210,8 +209,8 @@ class voicecommands(commands.Cog):
                 await interaction.followup.send("The provided link is not a valid YouTube video.", ephemeral=True)
                 return
             video_url = input
-            with ytdl.YoutubeDL(YDL_OPTS) as ydl:
-                info = ydl.extract_info(video_url, download=False)
+            try:
+                info = await asyncio.to_thread(lambda: ytdl.YoutubeDL(YDL_OPTS).extract_info(video_url, download=False))
                 if not info:
                     await interaction.followup.send("Could not extract information from that link.", ephemeral=True)
                     return
@@ -221,6 +220,10 @@ class voicecommands(commands.Cog):
                     await interaction.followup.send("No suitable audio format found for this video.", ephemeral=True)
                     return
                 audio_url = audio_format.get('url')
+            except Exception as e:
+                logger.error(f"Error extracting info for URL {video_url}: {e}")
+                await interaction.followup.send("An error occurred while processing the video.", ephemeral=True)
+                return
             track = {
                 "title": info.get("title", "Unknown Title"),
                 "url": video_url,
@@ -237,8 +240,8 @@ class voicecommands(commands.Cog):
             await interaction.followup.send(f"Added **{track['title']}** to the queue.", ephemeral=True)
         else:
             search_query = f"ytsearch:{input}"
-            with ytdl.YoutubeDL(YDL_OPTS) as ydl:
-                info = ydl.extract_info(search_query, download=False)
+            try:
+                info = await asyncio.to_thread(lambda: ytdl.YoutubeDL(YDL_OPTS).extract_info(search_query, download=False))
                 if not info or 'entries' not in info or len(info['entries']) == 0:
                     await interaction.followup.send("No results found for that query.", ephemeral=True)
                     return
@@ -250,31 +253,34 @@ class voicecommands(commands.Cog):
                 if not is_valid_youtube_video_url(video_url):
                     await interaction.followup.send("The top search result is not a valid YouTube video.", ephemeral=True)
                     return
-                with ytdl.YoutubeDL(YDL_OPTS) as ydl_inner:
-                    info_inner = ydl_inner.extract_info(video_url, download=False)
-                    if not info_inner:
-                        await interaction.followup.send("Could not extract information from the top search result.", ephemeral=True)
-                        return
-                    formats = info_inner.get('formats', [])
-                    audio_format = next((f for f in formats if f.get('acodec') != 'none'), None)
-                    if not audio_format:
-                        await interaction.followup.send("No suitable audio format found for the top search result.", ephemeral=True)
-                        return
-                    audio_url = audio_format.get('url')
-                track = {
-                    "title": info_inner.get("title", "Unknown Title"),
-                    "url": video_url,
-                    "requester": interaction.user.display_name,
-                    "source_url": audio_url
-                }
-                if len(data['queue']) >= MAX_QUEUE_SIZE:
-                    await interaction.followup.send("The queue is full. Please wait for some tracks to finish.", ephemeral=True)
+                info_inner = await asyncio.to_thread(lambda: ytdl.YoutubeDL(YDL_OPTS).extract_info(video_url, download=False))
+                if not info_inner:
+                    await interaction.followup.send("Could not extract information from the top search result.", ephemeral=True)
                     return
-                data['queue'].append(track)
-                logger.info(f"Added to queue in guild {guild_id}: {track['title']}")
-                if not data['current_track'] and not data['voice_client'].is_playing():
-                    await self.play_next(guild_id)
-                await interaction.followup.send(f"Added **{track['title']}** to the queue.", ephemeral=True)
+                formats = info_inner.get('formats', [])
+                audio_format = next((f for f in formats if f.get('acodec') != 'none'), None)
+                if not audio_format:
+                    await interaction.followup.send("No suitable audio format found for the top search result.", ephemeral=True)
+                    return
+                audio_url = audio_format.get('url')
+            except Exception as e:
+                logger.error(f"Error processing search query '{input}': {e}")
+                await interaction.followup.send("An error occurred while processing the search query.", ephemeral=True)
+                return
+            track = {
+                "title": info_inner.get("title", "Unknown Title"),
+                "url": video_url,
+                "requester": interaction.user.display_name,
+                "source_url": audio_url
+            }
+            if len(data['queue']) >= MAX_QUEUE_SIZE:
+                await interaction.followup.send("The queue is full. Please wait for some tracks to finish.", ephemeral=True)
+                return
+            data['queue'].append(track)
+            logger.info(f"Added to queue in guild {guild_id}: {track['title']}")
+            if not data['current_track'] and not data['voice_client'].is_playing():
+                await self.play_next(guild_id)
+            await interaction.followup.send(f"Added **{track['title']}** to the queue.", ephemeral=True)
 
     @dc.app_commands.command(name="skip", description="Skips the current track")
     async def skip(self, interaction: dc.Interaction):
@@ -357,7 +363,6 @@ class voicecommands(commands.Cog):
             logger.info(f"Removed track from queue in guild {guild_id}: {removed['title']}")
         else:
             await interaction.response.send_message("Invalid track index.", ephemeral=True)
-
 
 async def setup(bot):
     await bot.add_cog(voicecommands(bot))
