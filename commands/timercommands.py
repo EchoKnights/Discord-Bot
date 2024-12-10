@@ -1,6 +1,5 @@
 import sys
 import discord as dc
-import GitIgnorables.Authcode as Authcode
 from discord import app_commands
 from discord.ext import commands
 import asyncio  
