@@ -1,12 +1,9 @@
-import sys
 import discord as dc
-import nacl
-import GitIgnorables.Authcode as Authcode
 import commands.textcommands
 import asyncio
 import os
+import logging
 import json
-from discord import app_commands
 from discord.ext import commands
 
 intents = dc.Intents.default()
@@ -15,6 +12,25 @@ intents.guilds = True
 intents.voice_states = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+logging.basicConfig(
+    level=logging.INFO, #(DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    format='%(asctime)s:%(levelname)s:%(name)s: %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),  
+        logging.StreamHandler()
+    ]
+)
+#global version
+logger = logging.getLogger('bot')
+
+
+#config
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
+with open(CONFIG_PATH, 'r') as config_file:
+    config = json.load(config_file)
+bot.config = config
+TOKEN = config['token']
 
 @bot.event
 async def on_connect():
@@ -108,6 +124,6 @@ async def on_guild_join(guild: dc.Guild):
 async def run():
     async with bot:
         await bot.load_extension("commands")
-        await bot.start(Authcode.token)
+        await bot.start(TOKEN)
 
 asyncio.run(run())

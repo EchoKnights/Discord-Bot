@@ -1,9 +1,6 @@
 import sys
 import discord as dc
-from discord import app_commands
 from discord.ext import commands
-import asyncio
-import os
 
 class textcommands(commands.Cog):
     def __init__(self, bot):

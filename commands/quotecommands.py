@@ -1,7 +1,5 @@
 import json
-import sys
 import discord as dc
-from discord import app_commands
 from discord.ext import commands
 import asyncio
 import os
