@@ -1,15 +1,11 @@
-import re
 import os
 import asyncio
 import logging
-
-from datetime import datetime, timedelta
-from collections import defaultdict
+import json
 import discord as dc
 from discord.ext import commands
-import yt_dlp as ytdl
-import html
-import json
+from datetime import datetime
+from collections import defaultdict
 
 #Finding and Loading Opus (this took me 100 years to figure out because im not the smartest)
 current_directory = os.path.dirname(os.path.abspath(__file__))
